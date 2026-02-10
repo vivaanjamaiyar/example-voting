@@ -18,13 +18,12 @@ stages:
     steps:
     - checkout: self
 
-    
-  # Install required Java version for SonarScanner CLI
+    # Java needed for SonarScanner CLI
     - script: |
         sudo apt-get update
         sudo apt-get install -y openjdk-17-jre
+        java -version
       displayName: "Install Java 17"
-
 
     - task: SonarQubePrepare@7
       displayName: "Prepare SonarQube (Python)"
@@ -39,7 +38,6 @@ stages:
           sonar.sources=vote
           sonar.exclusions=**/__pycache__/**,**/venv/**,**/.venv/**
           sonar.python.coverage.reportPaths=vote/coverage.xml
-          # (optional) Let Sonar know which Python you're targeting
           sonar.python.version=3.10
 
     - script: |
@@ -53,6 +51,7 @@ stages:
         sudo apt-get install -y python3 python3-venv python3-pip
       displayName: "Ensure Python & venv are installed"
 
+    # Keep execution in repo root; target vote/ explicitly
     - script: |
         set -e
         cd $(Build.SourcesDirectory)
@@ -63,18 +62,23 @@ stages:
           python -m pip install -r vote/requirements.txt
         fi
         python -m pip install pytest pytest-cov
-        cd vote
-        echo "Running tests with coverage..."
-        pytest -q --cov=. --cov-report=xml:coverage.xml || echo "pytest failed or no tests discovered; continuing"
-        test -f coverage.xml && echo "coverage.xml generated" || echo "No coverage.xml generated"
-      displayName: "Run Python Tests in venv (auto-discovery)"
+        echo "Running tests with coverage in vote/..."
+        pytest vote -q --cov=vote --cov-report=xml:vote/coverage.xml || echo "pytest failed or no tests discovered; continuing"
+        test -f vote/coverage.xml && echo "coverage.xml generated" || echo "No coverage.xml generated"
+      displayName: "Run Python Tests (stay in root)"
+
+    # (Optional) ensure we're at repo root (belt-and-braces)
+    - script: |
+        cd $(Build.SourcesDirectory)
+        pwd
+      displayName: "Confirm repo root for analysis"
 
     - task: SonarQubeAnalyze@7
       displayName: "Run SonarQube Analysis (Python)"
 
     - script: |
-        echo "Scanner work dir (if CLI produced output):"
-        find $(Build.SourcesDirectory) -maxdepth 3 -type f -name "report-task.txt" -print -exec cat {} \; || true
+        echo "Searching for report-task.txt..."
+        find $(Build.SourcesDirectory) -maxdepth 6 -type f -name "report-task.txt" -print -exec sed -n '1,120p' {} \; || true
       displayName: "Debug: Show report-task.txt if present"
 
     - task: SonarQubePublish@7
