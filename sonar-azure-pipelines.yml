@@ -124,4 +124,3 @@ stages:
       displayName: "Publish Quality Gate (Node)"
       inputs:
         pollingTimeoutSec: "300"
-``
