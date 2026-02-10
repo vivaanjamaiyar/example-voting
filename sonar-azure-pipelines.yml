@@ -2,27 +2,36 @@ trigger:
   branches:
     include:
       - main
-      - develop
-
-variables:
-  SONARQUBE_SERVICE: 'sonarqube-connection'
 
 pool:
- name: 'azureagent'
+  name: 'azureagent'   # your self-hosted agent pool
+
+variables:
+  SONARQUBE_SERVICE: 'sonarqube-connection'   # your connection name
 
 stages:
-- stage: SonarAnalysis
-  displayName: "Run SonarQube Analysis"
-  jobs:
 
-  # ---------------- PYTHON FRONTEND ----------------
+# ============================
+#  PYTHON FRONTEND ANALYSIS
+# ============================
+- stage: Python_Analysis
+  displayName: "Python Frontend - SonarQube Analysis"
+  jobs:
   - job: PythonFrontend
     displayName: "Analyze Python Frontend"
     steps:
+
     - checkout: self
 
+    - script: |
+        echo "Folders under repo:"
+        ls -la
+        echo "Contents of vote/:"
+        ls -la vote
+      displayName: "Debug Listing"
+
     - task: SonarQubePrepare@7
-      displayName: "Prepare SonarQube Analysis (Python)"
+      displayName: "Prepare SonarQube (Python)"
       inputs:
         SonarQube: $(SONARQUBE_SERVICE)
         scannerMode: "Other"
@@ -30,73 +39,94 @@ stages:
         cliProjectKey: "vote-frontend-python"
         cliProjectName: "vote-frontend-python"
         extraProperties: |
-          sonar.projectVersion=$(Build.BuildNumber)
-          sonar.sources=frontend-python
-          sonar.python.coverage.reportPaths=frontend-python/coverage.xml
-
-    - task: UsePythonVersion@0
-      inputs:
-        versionSpec: "3.x"
+          sonar.sources=vote
+          sonar.exclusions=**/__pycache__/**,**/venv/**,**/.venv/**
+          sonar.python.coverage.reportPaths=vote/coverage.xml
 
     - script: |
-        pip install -r frontend-python/requirements.txt
-        pip install pytest pytest-cov
-        pytest frontend-python/tests --cov=frontend-python --cov-report=xml:frontend-python/coverage.xml
+        sudo apt-get update
+        sudo apt-get install -y python3 python3-pip python3-venv
+        python3 -m pip install --upgrade pip
+        pip3 install -r vote/requirements.txt
+        pip3 install pytest pytest-cov
+        pytest -q vote/tests --cov=vote --cov-report=xml:vote/coverage.xml
       displayName: "Run Python Tests"
 
     - task: SonarQubeAnalyze@7
-      displayName: "Run Analysis (Python)"
+      displayName: "Run SonarQube Analysis (Python)"
 
     - task: SonarQubePublish@7
       displayName: "Publish Quality Gate (Python)"
       inputs:
         pollingTimeoutSec: "300"
 
-  # ---------------- DOTNET WORKER ----------------
+
+# ============================
+#  DOTNET WORKER ANALYSIS
+# ============================
+- stage: DotNet_Analysis
+  displayName: ".NET Worker - SonarQube Analysis"
+  jobs:
   - job: DotNetWorker
-    displayName: "Analyze .NET Worker"
+    displayName: "Analyze .NET Worker Service"
     steps:
+
     - checkout: self
 
+    - script: |
+        echo "Contents of worker/:"
+        ls -la worker
+      displayName: "Debug worker folder"
+
     - task: SonarQubePrepare@7
-      displayName: "Prepare SonarQube Analysis (.NET)"
+      displayName: "Prepare SonarQube (.NET)"
       inputs:
         SonarQube: $(SONARQUBE_SERVICE)
         scannerMode: "MSBuild"
         projectKey: "vote-worker-dotnet"
         projectName: "vote-worker-dotnet"
         extraProperties: |
-          sonar.cs.opencover.reportsPaths=$(Build.SourcesDirectory)/worker-dotnet/TestResults/coverage.opencover.xml
-
-    - task: UseDotNet@2
-      inputs:
-        versionSpec: "8.x"
+          sonar.cs.opencover.reportsPaths=$(Build.SourcesDirectory)/worker/TestResults/coverage.opencover.xml
 
     - script: |
-        dotnet restore worker-dotnet/YourSolution.sln
-        dotnet build worker-dotnet/YourSolution.sln --configuration Release
-        dotnet test worker-dotnet/YourSolution.sln --configuration Release \
-          /p:CollectCoverage=true \
-          /p:CoverletOutput=$(Build.SourcesDirectory)/worker-dotnet/TestResults/coverage.opencover.xml \
-          /p:CoverletOutputFormat=opencover
+        sudo apt-get update
+        sudo apt-get install -y dotnet-sdk-8.0
+        dotnet restore worker
+        dotnet build worker --configuration Release
+        dotnet test worker --configuration Release \
+            /p:CollectCoverage=true \
+            /p:CoverletOutput=$(Build.SourcesDirectory)/worker/TestResults/coverage.opencover.xml \
+            /p:CoverletOutputFormat=opencover
       displayName: "Build & Test (.NET)"
 
     - task: SonarQubeAnalyze@7
-      displayName: "Run Analysis (.NET)"
+      displayName: "Run SonarQube Analysis (.NET)"
 
     - task: SonarQubePublish@7
       displayName: "Publish Quality Gate (.NET)"
       inputs:
         pollingTimeoutSec: "300"
 
-  # ---------------- NODE RESULTS APP ----------------
+
+# ============================
+#  NODE.JS RESULTS ANALYSIS
+# ============================
+- stage: Node_Analysis
+  displayName: "Node.js Results App - SonarQube Analysis"
+  jobs:
   - job: NodeResults
     displayName: "Analyze Node.js Results App"
     steps:
+
     - checkout: self
 
+    - script: |
+        echo "Contents of result/:"
+        ls -la result
+      displayName: "Debug result folder"
+
     - task: SonarQubePrepare@7
-      displayName: "Prepare SonarQube Analysis (Node)"
+      displayName: "Prepare SonarQube (Node)"
       inputs:
         SonarQube: $(SONARQUBE_SERVICE)
         scannerMode: "Other"
@@ -104,21 +134,20 @@ stages:
         cliProjectKey: "vote-results-node"
         cliProjectName: "vote-results-node"
         extraProperties: |
-          sonar.sources=results-node
-          sonar.javascript.lcov.reportPaths=results-node/coverage/lcov.info
-
-    - task: NodeTool@0
-      inputs:
-        versionSpec: "20.x"
+          sonar.sources=result
+          sonar.exclusions=**/node_modules/**,**/dist/**,**/build/**
+          sonar.javascript.lcov.reportPaths=result/coverage/lcov.info
 
     - script: |
-        cd results-node
-        npm ci
+        sudo apt-get update
+        sudo apt-get install -y nodejs npm
+        cd result
+        npm install     # using install instead of ci because you likely don’t have package-lock.json
         npm test -- --coverage
-      displayName: "Run Node Tests"
+      displayName: "Install Node Modules & Run Tests"
 
     - task: SonarQubeAnalyze@7
-      displayName: "Run Analysis (Node)"
+      displayName: "Run SonarQube Analysis (Node)"
 
     - task: SonarQubePublish@7
       displayName: "Publish Quality Gate (Node)"
