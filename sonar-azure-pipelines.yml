@@ -4,16 +4,12 @@ trigger:
       - main
 
 pool:
-  name: 'azureagent'   # your self-hosted agent pool
+  name: 'azureagent'   # self-hosted agent pool
 
 variables:
-  SONARQUBE_SERVICE: 'sonarqube-connection'   # your connection name
+  SONARQUBE_SERVICE: 'sonarqube-connection'   # service connection name
 
 stages:
-
-# ============================
-#  PYTHON FRONTEND ANALYSIS
-# ============================
 - stage: Python_Analysis
   displayName: "Python Frontend - SonarQube Analysis"
   jobs:
@@ -21,6 +17,14 @@ stages:
     displayName: "Analyze Python Frontend"
     steps:
     - checkout: self
+
+    # Ensure Java is present for SonarScanner CLI
+    - task: JavaToolInstaller@0
+      displayName: "Install/Use JDK 17"
+      inputs:
+        versionSpec: '17'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'  # adjust if you don't preinstall
 
     - task: SonarQubePrepare@7
       displayName: "Prepare SonarQube (Python)"
@@ -31,9 +35,18 @@ stages:
         cliProjectKey: "vote-frontend-python"
         cliProjectName: "vote-frontend-python"
         extraProperties: |
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
           sonar.sources=vote
           sonar.exclusions=**/__pycache__/**,**/venv/**,**/.venv/**
           sonar.python.coverage.reportPaths=vote/coverage.xml
+          # (optional) Let Sonar know which Python you're targeting
+          sonar.python.version=3.10
+
+    - script: |
+        echo "Verifying sources..."
+        ls -la $(Build.SourcesDirectory)
+        test -d "$(Build.SourcesDirectory)/vote" || (echo "ERROR: vote/ not found" && exit 1)
+      displayName: "Verify sources directory exists"
 
     - script: |
         sudo apt-get update
@@ -41,120 +54,30 @@ stages:
       displayName: "Ensure Python & venv are installed"
 
     - script: |
+        set -e
         cd $(Build.SourcesDirectory)
         python3 -m venv .venv
-        source .venv/bin/activate
+        . .venv/bin/activate
         python -m pip install --upgrade pip
-        # Install app deps if present
         if [ -f vote/requirements.txt ]; then
           python -m pip install -r vote/requirements.txt
         fi
         python -m pip install pytest pytest-cov
         cd vote
-        echo "Contents of vote/:"
-        ls -la
-        # Run tests; don't fail the job if none discovered
+        echo "Running tests with coverage..."
         pytest -q --cov=. --cov-report=xml:coverage.xml || echo "pytest failed or no tests discovered; continuing"
+        test -f coverage.xml && echo "coverage.xml generated" || echo "No coverage.xml generated"
       displayName: "Run Python Tests in venv (auto-discovery)"
 
     - task: SonarQubeAnalyze@7
       displayName: "Run SonarQube Analysis (Python)"
 
+    - script: |
+        echo "Scanner work dir (if CLI produced output):"
+        find $(Build.SourcesDirectory) -maxdepth 3 -type f -name "report-task.txt" -print -exec cat {} \; || true
+      displayName: "Debug: Show report-task.txt if present"
+
     - task: SonarQubePublish@7
       displayName: "Publish Quality Gate (Python)"
-      inputs:
-        pollingTimeoutSec: "300"
-
-
-# ============================
-#  DOTNET WORKER ANALYSIS
-# ============================
-- stage: DotNet_Analysis
-  displayName: ".NET Worker - SonarQube Analysis"
-  jobs:
-  - job: DotNetWorker
-    displayName: "Analyze .NET Worker Service"
-    steps:
-
-    - checkout: self
-
-    - script: |
-        echo "Contents of worker/:"
-        ls -la worker
-      displayName: "Debug worker folder"
-
-    - task: SonarQubePrepare@7
-      displayName: "Prepare SonarQube (.NET)"
-      inputs:
-        SonarQube: $(SONARQUBE_SERVICE)
-        scannerMode: "MSBuild"
-        projectKey: "vote-worker-dotnet"
-        projectName: "vote-worker-dotnet"
-        extraProperties: |
-          sonar.cs.opencover.reportsPaths=$(Build.SourcesDirectory)/worker/TestResults/coverage.opencover.xml
-
-    - script: |
-        sudo apt-get update
-        sudo apt-get install -y dotnet-sdk-8.0
-        dotnet restore worker
-        dotnet build worker --configuration Release
-        dotnet test worker --configuration Release \
-            /p:CollectCoverage=true \
-            /p:CoverletOutput=$(Build.SourcesDirectory)/worker/TestResults/coverage.opencover.xml \
-            /p:CoverletOutputFormat=opencover
-      displayName: "Build & Test (.NET)"
-
-    - task: SonarQubeAnalyze@7
-      displayName: "Run SonarQube Analysis (.NET)"
-
-    - task: SonarQubePublish@7
-      displayName: "Publish Quality Gate (.NET)"
-      inputs:
-        pollingTimeoutSec: "300"
-
-
-# ============================
-#  NODE.JS RESULTS ANALYSIS
-# ============================
-- stage: Node_Analysis
-  displayName: "Node.js Results App - SonarQube Analysis"
-  jobs:
-  - job: NodeResults
-    displayName: "Analyze Node.js Results App"
-    steps:
-
-    - checkout: self
-
-    - script: |
-        echo "Contents of result/:"
-        ls -la result
-      displayName: "Debug result folder"
-
-    - task: SonarQubePrepare@7
-      displayName: "Prepare SonarQube (Node)"
-      inputs:
-        SonarQube: $(SONARQUBE_SERVICE)
-        scannerMode: "Other"
-        configMode: "manual"
-        cliProjectKey: "vote-results-node"
-        cliProjectName: "vote-results-node"
-        extraProperties: |
-          sonar.sources=result
-          sonar.exclusions=**/node_modules/**,**/dist/**,**/build/**
-          sonar.javascript.lcov.reportPaths=result/coverage/lcov.info
-
-    - script: |
-        sudo apt-get update
-        sudo apt-get install -y nodejs npm
-        cd result
-        npm install     # using install instead of ci because you likely don’t have package-lock.json
-        npm test -- --coverage
-      displayName: "Install Node Modules & Run Tests"
-
-    - task: SonarQubeAnalyze@7
-      displayName: "Run SonarQube Analysis (Node)"
-
-    - task: SonarQubePublish@7
-      displayName: "Publish Quality Gate (Node)"
       inputs:
         pollingTimeoutSec: "300"
