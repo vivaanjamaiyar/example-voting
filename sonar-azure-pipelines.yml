@@ -18,13 +18,13 @@ stages:
     steps:
     - checkout: self
 
-    # Ensure Java is present for SonarScanner CLI
-    - task: JavaToolInstaller@0
-      displayName: "Install/Use JDK 17"
-      inputs:
-        versionSpec: '17'
-        jdkArchitectureOption: 'x64'
-        jdkSourceOption: 'PreInstalled'  # adjust if you don't preinstall
+    
+  # Install required Java version for SonarScanner CLI
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y openjdk-17-jre
+      displayName: "Install Java 17"
+
 
     - task: SonarQubePrepare@7
       displayName: "Prepare SonarQube (Python)"
