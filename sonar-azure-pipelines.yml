@@ -1,0 +1,127 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  SONARQUBE_SERVICE: 'sonarqube-connection'
+
+pool:
+ name: 'azureagent'
+
+stages:
+- stage: SonarAnalysis
+  displayName: "Run SonarQube Analysis"
+  jobs:
+
+  # ---------------- PYTHON FRONTEND ----------------
+  - job: PythonFrontend
+    displayName: "Analyze Python Frontend"
+    steps:
+    - checkout: self
+
+    - task: SonarQubePrepare@7
+      displayName: "Prepare SonarQube Analysis (Python)"
+      inputs:
+        SonarQube: $(SONARQUBE_SERVICE)
+        scannerMode: "Other"
+        configMode: "manual"
+        cliProjectKey: "vote-frontend-python"
+        cliProjectName: "vote-frontend-python"
+        extraProperties: |
+          sonar.projectVersion=$(Build.BuildNumber)
+          sonar.sources=frontend-python
+          sonar.python.coverage.reportPaths=frontend-python/coverage.xml
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: "3.x"
+
+    - script: |
+        pip install -r frontend-python/requirements.txt
+        pip install pytest pytest-cov
+        pytest frontend-python/tests --cov=frontend-python --cov-report=xml:frontend-python/coverage.xml
+      displayName: "Run Python Tests"
+
+    - task: SonarQubeAnalyze@7
+      displayName: "Run Analysis (Python)"
+
+    - task: SonarQubePublish@7
+      displayName: "Publish Quality Gate (Python)"
+      inputs:
+        pollingTimeoutSec: "300"
+
+  # ---------------- DOTNET WORKER ----------------
+  - job: DotNetWorker
+    displayName: "Analyze .NET Worker"
+    steps:
+    - checkout: self
+
+    - task: SonarQubePrepare@7
+      displayName: "Prepare SonarQube Analysis (.NET)"
+      inputs:
+        SonarQube: $(SONARQUBE_SERVICE)
+        scannerMode: "MSBuild"
+        projectKey: "vote-worker-dotnet"
+        projectName: "vote-worker-dotnet"
+        extraProperties: |
+          sonar.cs.opencover.reportsPaths=$(Build.SourcesDirectory)/worker-dotnet/TestResults/coverage.opencover.xml
+
+    - task: UseDotNet@2
+      inputs:
+        versionSpec: "8.x"
+
+    - script: |
+        dotnet restore worker-dotnet/YourSolution.sln
+        dotnet build worker-dotnet/YourSolution.sln --configuration Release
+        dotnet test worker-dotnet/YourSolution.sln --configuration Release \
+          /p:CollectCoverage=true \
+          /p:CoverletOutput=$(Build.SourcesDirectory)/worker-dotnet/TestResults/coverage.opencover.xml \
+          /p:CoverletOutputFormat=opencover
+      displayName: "Build & Test (.NET)"
+
+    - task: SonarQubeAnalyze@7
+      displayName: "Run Analysis (.NET)"
+
+    - task: SonarQubePublish@7
+      displayName: "Publish Quality Gate (.NET)"
+      inputs:
+        pollingTimeoutSec: "300"
+
+  # ---------------- NODE RESULTS APP ----------------
+  - job: NodeResults
+    displayName: "Analyze Node.js Results App"
+    steps:
+    - checkout: self
+
+    - task: SonarQubePrepare@7
+      displayName: "Prepare SonarQube Analysis (Node)"
+      inputs:
+        SonarQube: $(SONARQUBE_SERVICE)
+        scannerMode: "Other"
+        configMode: "manual"
+        cliProjectKey: "vote-results-node"
+        cliProjectName: "vote-results-node"
+        extraProperties: |
+          sonar.sources=results-node
+          sonar.javascript.lcov.reportPaths=results-node/coverage/lcov.info
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: "20.x"
+
+    - script: |
+        cd results-node
+        npm ci
+        npm test -- --coverage
+      displayName: "Run Node Tests"
+
+    - task: SonarQubeAnalyze@7
+      displayName: "Run Analysis (Node)"
+
+    - task: SonarQubePublish@7
+      displayName: "Publish Quality Gate (Node)"
+      inputs:
+        pollingTimeoutSec: "300"
+``
