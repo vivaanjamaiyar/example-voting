@@ -8,6 +8,9 @@ pool:
 
 variables:
   SONARQUBE_SERVICE: 'sonarqube-connection'   # your SonarQube service connection
+  SONAR_HOST_URL: 'http://74.242.168.143:9000'
+  SONAR_TOKEN: 'sqa_744e33c00ce889d56e020391849fccc4a3236f79'
+
   system.debug: 'true'                        # verbose logs
 
 stages:
