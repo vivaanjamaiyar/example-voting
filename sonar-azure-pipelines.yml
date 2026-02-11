@@ -8,11 +8,7 @@ pool:
 
 variables:
   SONARQUBE_SERVICE: 'sonarqube-connection'   # your SonarQube service connection
-  # Add these in your pipeline variables (set SONAR_TOKEN as 'secret'):
-  SONAR_HOST_URL: 'http://74.242.168.143:9000'
-  SONAR_TOKEN: sqa_744e33c00ce889d56e020391849fccc4a3236f79
-
-  system.debug: 'true'  # verbose logs for Sonar tasks
+  system.debug: 'true'                        # verbose logs
 
 stages:
 - stage: Python_Analysis
@@ -23,20 +19,21 @@ stages:
     steps:
     - checkout: self
 
-    # 1) Java (scanner requirement)
+    # 1) Java 21 for scanner
     - script: |
         set -eux
         sudo apt-get update
-        sudo apt-get install -y openjdk-17-jre curl unzip
+        sudo apt-get install -y openjdk-21-jre curl unzip
         java -version
-      displayName: "Install Java 17 and tools"
+      displayName: "Install Java 21 and tools"
 
-    # 2) Prepare (so Publish knows the server via the service connection)
+    # 2) Prepare (lets Publish know the server via service connection)
+    #    IMPORTANT: no sonar.branch.name here (Community Edition)
     - task: SonarQubePrepare@7
       displayName: "Prepare SonarQube (for Publish)"
       inputs:
         SonarQube: $(SONARQUBE_SERVICE)
-        scannerMode: "Other"             # CLI mode (we'll run CLI ourselves)
+        scannerMode: "Other"
         configMode: "manual"
         cliProjectKey: "vote-frontend-python"
         cliProjectName: "vote-frontend-python"
@@ -46,8 +43,6 @@ stages:
           sonar.exclusions=**/__pycache__/**,**/venv/**,**/.venv/**,**/.tox/**
           sonar.python.coverage.reportPaths=vote/coverage.xml
           sonar.python.version=3.10
-          # Optional:
-          sonar.branch.name=$(Build.SourceBranchName)
 
     # 3) Verify repo layout
     - script: |
@@ -57,14 +52,14 @@ stages:
         test -d "$(Build.SourcesDirectory)/vote" || (echo "ERROR: vote/ not found at repo root" && exit 1)
       displayName: "Verify sources directory exists"
 
-    # 4) Python toolchain
+    # 4) Ensure Python
     - script: |
         set -eux
         sudo apt-get update
         sudo apt-get install -y python3 python3-venv python3-pip
         python3 --version
         pip3 --version
-      displayName: "Ensure Python & pip are installed"
+      displayName: "Ensure Python & pip"
 
     # 5) Venv + tests + coverage (stay in repo root)
     - script: |
@@ -86,12 +81,18 @@ stages:
         fi
       displayName: "Run Python tests (root, target vote/)"
 
-    # 6) Download and run SonarScanner CLI (manual; bypasses Analyze task guards)
+    # 6) Download & run SonarScanner CLI (avoid reading repo sonar-project.properties)
     - script: |
         set -euxo pipefail
         cd "$(Build.SourcesDirectory)"
 
-        # Download official SonarScanner CLI (adjust version as needed)
+        # Optional: detect any branch property in repo configs and warn
+        if grep -R --line-number -E '^\s*sonar\.branch\.name\s*=' . || true; then
+          echo "NOTE: Detected 'sonar.branch.name' in repo. Community Edition doesn't support it."
+          echo "The scanner will IGNORE repo properties by using an empty project settings file."
+        fi
+
+        # Download official SonarScanner CLI
         SCANNER_VERSION="5.0.1.3006"
         SCANNER_DIR="$(Build.SourcesDirectory)/.scanner"
         mkdir -p "$SCANNER_DIR"
@@ -101,8 +102,13 @@ stages:
         SCANNER_BIN="$(find "$SCANNER_DIR" -type f -path "*/bin/sonar-scanner" | head -n1)"
         chmod +x "$SCANNER_BIN"
 
-        # Run scanner from repo root
+        # Provide an empty project settings file so we don't read repo sonar-project.properties
+        EMPTY_PROPS="$SCANNER_DIR/empty.properties"
+        : > "$EMPTY_PROPS"
+
+        # Run scanner from repo root (NO sonar.branch.name)
         "$SCANNER_BIN" \
+          -Dproject.settings="$EMPTY_PROPS" \
           -Dsonar.host.url="$(SONAR_HOST_URL)" \
           -Dsonar.login="$(SONAR_TOKEN)" \
           -Dsonar.projectKey="vote-frontend-python" \
@@ -110,7 +116,7 @@ stages:
           -Dsonar.sources="vote" \
           -Dsonar.python.coverage.reportPaths="vote/coverage.xml"
 
-        # Confirm report-task.txt got created at the standard CLI path
+        # Confirm report-task.txt
         REPORT_SRC="$(Build.SourcesDirectory)/.scannerwork/report-task.txt"
         if [ -f "$REPORT_SRC" ]; then
           echo "Found report-task.txt at $REPORT_SRC"
@@ -120,9 +126,9 @@ stages:
           find "$(Build.SourcesDirectory)" -maxdepth 10 -type f -name "report-task.txt" -print -exec sed -n '1,160p' {} \; || true
           exit 1
         fi
-      displayName: "Download & run SonarScanner CLI (manual)"
+      displayName: "Download & run SonarScanner CLI (manual, no branches)"
 
-    # 7) Copy report-task.txt to where Publish expects it (ADO convention)
+    # 7) Copy report-task.txt to where Publish expects it
     - script: |
         set -eux
         SRC="$(Build.SourcesDirectory)/.scannerwork/report-task.txt"
