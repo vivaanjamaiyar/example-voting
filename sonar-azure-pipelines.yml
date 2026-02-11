@@ -4,14 +4,13 @@ trigger:
       - main
 
 pool:
-  name: 'azureagent'   # your self-hosted Linux agent
+  name: 'azureagent'   # your self-hosted Linux agent pool
 
 variables:
-  SONARQUBE_SERVICE: 'sonarqube-connection'   # your SonarQube service connection
+  SONARQUBE_SERVICE: 'sonarqube-connection'   # ADO service connection (used by Publish)
   SONAR_HOST_URL: 'http://74.242.168.143:9000'
   SONAR_TOKEN: 'sqa_744e33c00ce889d56e020391849fccc4a3236f79'
-
-  system.debug: 'true'                        # verbose logs
+  system.debug: 'true'                        # verbose logs for Sonar tasks
 
 stages:
 - stage: Python_Analysis
@@ -22,7 +21,40 @@ stages:
     steps:
     - checkout: self
 
-    # 1) Java 21 for scanner
+    # 0) Validate required variables and connectivity to SonarQube
+    - script: |
+        set -euo pipefail
+        HOST="$(SONAR_HOST_URL)"
+        TOKEN_PRESENT=""
+        if [ -n "$(SONAR_TOKEN)" ]; then TOKEN_PRESENT="yes"; fi
+
+        if [ -z "$HOST" ]; then
+          echo "ERROR: Pipeline variable SONAR_HOST_URL is not set."
+          echo "       Set it to your SonarQube URL, e.g. https://sonarqube.mycompany.com"
+          exit 1
+        fi
+        if [ -z "$TOKEN_PRESENT" ]; then
+          echo "ERROR: Pipeline secret SONAR_TOKEN is not set."
+          echo "       Create a SonarQube token with Execute Analysis permission and add it as a secret variable."
+          exit 1
+        fi
+
+        echo "Checking connectivity to: $HOST"
+        STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "$HOST/api/system/ping" || true)
+        echo "Ping status: $STATUS"
+        if [ "$STATUS" != "200" ]; then
+          echo "WARNING: Ping didn't return 200. Trying /api/server/version with auth..."
+          STATUS2=$(curl -sS -u "$(SONAR_TOKEN):" -o /dev/null -w "%{http_code}" "$HOST/api/server/version" || true)
+          echo "Version status: $STATUS2"
+          if [ "$STATUS2" != "200" ]; then
+            echo "ERROR: Cannot reach SonarQube at $HOST from this agent."
+            echo "       Check URL, firewall/proxy, or TLS certs. If behind a proxy, set https_proxy/http_proxy env vars."
+            exit 1
+          fi
+        fi
+      displayName: "Validate Sonar variables & connectivity"
+
+    # 1) Install Java 21 (scanner requirement going forward)
     - script: |
         set -eux
         sudo apt-get update
@@ -30,13 +62,13 @@ stages:
         java -version
       displayName: "Install Java 21 and tools"
 
-    # 2) Prepare (lets Publish know the server via service connection)
-    #    IMPORTANT: no sonar.branch.name here (Community Edition)
+    # 2) Prepare (lets Publish know the server via the service connection)
+    #    IMPORTANT: No sonar.branch.name here (Community Edition)
     - task: SonarQubePrepare@7
       displayName: "Prepare SonarQube (for Publish)"
       inputs:
         SonarQube: $(SONARQUBE_SERVICE)
-        scannerMode: "Other"
+        scannerMode: "Other"             # We'll run CLI manually
         configMode: "manual"
         cliProjectKey: "vote-frontend-python"
         cliProjectName: "vote-frontend-python"
@@ -84,18 +116,15 @@ stages:
         fi
       displayName: "Run Python tests (root, target vote/)"
 
-    # 6) Download & run SonarScanner CLI (avoid reading repo sonar-project.properties)
+    # 6) Download & run SonarScanner CLI (manual; ignore repo properties)
     - script: |
         set -euxo pipefail
         cd "$(Build.SourcesDirectory)"
 
-        # Optional: detect any branch property in repo configs and warn
-        if grep -R --line-number -E '^\s*sonar\.branch\.name\s*=' . || true; then
-          echo "NOTE: Detected 'sonar.branch.name' in repo. Community Edition doesn't support it."
-          echo "The scanner will IGNORE repo properties by using an empty project settings file."
-        fi
+        echo "Scanning repo for branch/PR properties (Community Edition does not allow these)..."
+        grep -R --line-number -E '^\s*sonar\.branch\.name\s*=' . || true
+        grep -R --line-number -E '^\s*sonar\.pullrequest\.' . || true
 
-        # Download official SonarScanner CLI
         SCANNER_VERSION="5.0.1.3006"
         SCANNER_DIR="$(Build.SourcesDirectory)/.scanner"
         mkdir -p "$SCANNER_DIR"
@@ -105,11 +134,11 @@ stages:
         SCANNER_BIN="$(find "$SCANNER_DIR" -type f -path "*/bin/sonar-scanner" | head -n1)"
         chmod +x "$SCANNER_BIN"
 
-        # Provide an empty project settings file so we don't read repo sonar-project.properties
+        # Provide an EMPTY project settings file so the scanner does NOT read repo props (e.g., sonar-project.properties)
         EMPTY_PROPS="$SCANNER_DIR/empty.properties"
         : > "$EMPTY_PROPS"
 
-        # Run scanner from repo root (NO sonar.branch.name)
+        echo "Running SonarScanner with an EMPTY project settings file to avoid branch/PR props from repo..."
         "$SCANNER_BIN" \
           -Dproject.settings="$EMPTY_PROPS" \
           -Dsonar.host.url="$(SONAR_HOST_URL)" \
@@ -129,9 +158,9 @@ stages:
           find "$(Build.SourcesDirectory)" -maxdepth 10 -type f -name "report-task.txt" -print -exec sed -n '1,160p' {} \; || true
           exit 1
         fi
-      displayName: "Download & run SonarScanner CLI (manual, no branches)"
+      displayName: "Download & run SonarScanner CLI (manual, ignore repo props)"
 
-    # 7) Copy report-task.txt to where Publish expects it
+    # 7) Copy report-task.txt where Publish expects it
     - script: |
         set -eux
         SRC="$(Build.SourcesDirectory)/.scannerwork/report-task.txt"
