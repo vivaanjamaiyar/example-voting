@@ -8,7 +8,7 @@ pool:
 
 variables:
   SONARQUBE_SERVICE: 'sonarqube-connection'
-  system.debug: 'true'  # enable verbose logs for Sonar tasks
+  system.debug: 'true'  # verbose logs for Sonar tasks
 
 stages:
 - stage: Python_Analysis
@@ -19,33 +19,34 @@ stages:
     steps:
     - checkout: self
 
-    # Java is required by SonarScanner
+    # --- Java is required by SonarScanner ---
     - script: |
         set -eux
         sudo apt-get update
         sudo apt-get install -y openjdk-17-jre
         java -version
-      displayName: "Install Java 17"
+      displayName: "Install Java 17 (required for SonarScanner)"
 
-    # Prepare in CLI/Other mode
+    # --- Prepare SonarQube (CLI/Other mode) ---
     - task: SonarQubePrepare@7
       displayName: "Prepare SonarQube (Python via CLI)"
       inputs:
         SonarQube: $(SONARQUBE_SERVICE)
-        scannerMode: "Other"
+        scannerMode: "Other"             # CLI mode
         configMode: "manual"
         cliProjectKey: "vote-frontend-python"
         cliProjectName: "vote-frontend-python"
         extraProperties: |
+          # Keep everything anchored at repo root
           sonar.projectBaseDir=$(Build.SourcesDirectory)
           sonar.sources=vote
           sonar.exclusions=**/__pycache__/**,**/venv/**,**/.venv/**,**/.tox/**
           sonar.python.coverage.reportPaths=vote/coverage.xml
           sonar.python.version=3.10
-          # Optional if you use branches:
+          # Optional if you use branches
           sonar.branch.name=$(Build.SourceBranchName)
 
-    # Verify repo layout
+    # --- Verify repo layout ---
     - script: |
         set -eux
         echo "Repo root: $(Build.SourcesDirectory)"
@@ -53,7 +54,7 @@ stages:
         test -d "$(Build.SourcesDirectory)/vote" || (echo "ERROR: vote/ not found at repo root" && exit 1)
       displayName: "Verify sources directory exists"
 
-    # Ensure Python
+    # --- Ensure Python ---
     - script: |
         set -eux
         sudo apt-get update
@@ -62,7 +63,7 @@ stages:
         pip3 --version
       displayName: "Ensure Python & pip are installed"
 
-    # Create venv, install deps, run tests & coverage (stay in repo root)
+    # --- Create venv, install deps, run tests & coverage (stay in repo root) ---
     - script: |
         set -euxo pipefail
         cd "$(Build.SourcesDirectory)"
@@ -82,44 +83,71 @@ stages:
         fi
       displayName: "Run Python tests (root, target vote/)"
 
-    # Hide root Maven/Gradle files to prevent Analyze short-circuit in monorepos
+    # --- IMPORTANT: Recursively hide Maven/Gradle files anywhere in the repo ---
     - script: |
-        set -eux
+        set -euxo pipefail
         cd "$(Build.SourcesDirectory)"
-        mkdir -p .sonar_tmp_hide
-        for f in pom.xml build.gradle build.gradle.kts settings.gradle settings.gradle.kts gradle.properties; do
-          if [ -f "$f" ]; then
-            mv "$f" ".sonar_tmp_hide/$f"
-            echo "Temporarily hid $f"
-          fi
-        done
-      displayName: "Temporarily hide root Maven/Gradle files"
+        HIDE_DIR=".sonar_tmp_hide"
+        rm -rf "$HIDE_DIR"
+        mkdir -p "$HIDE_DIR"
 
-    # Run analysis via the ADO task (uses the service connection)
+        # Find typical Maven/Gradle files anywhere below the repo root.
+        # Adjust patterns if you have additional build files.
+        mapfile -d '' FILES < <(find "$(pwd)" -type f \( \
+            -name "pom.xml" -o \
+            -name "build.gradle" -o \
+            -name "build.gradle.kts" -o \
+            -name "settings.gradle" -o \
+            -name "settings.gradle.kts" -o \
+            -name "gradle.properties" \
+          \) -print0)
+
+        if [ "${#FILES[@]}" -gt 0 ]; then
+          echo "Hiding ${#FILES[@]} Maven/Gradle file(s)..."
+          for SRC in "${FILES[@]}"; do
+            # Keep relative path under HIDE_DIR for safe restoration
+            REL="${SRC#$(pwd)/}"
+            DEST="$HIDE_DIR/$REL"
+            mkdir -p "$(dirname "$DEST")"
+            mv "$SRC" "$DEST"
+            echo "  hid: $REL"
+          done
+        else
+          echo "No Maven/Gradle files found to hide."
+        fi
+      displayName: "Recursively hide Maven/Gradle files (monorepo guard)"
+
+    # --- Run analysis via the ADO task (uses service connection) ---
     - task: SonarQubeAnalyze@7
       displayName: "Run SonarQube Analysis (Python)"
 
-    # Restore build files right after analyze
+    # --- Restore all hidden files immediately after analysis ---
     - script: |
-        set -eux
+        set -euxo pipefail
         cd "$(Build.SourcesDirectory)"
-        if [ -d .sonar_tmp_hide ]; then
-          for f in pom.xml build.gradle build.gradle.kts settings.gradle settings.gradle.kts gradle.properties; do
-            if [ -f ".sonar_tmp_hide/$f" ]; then
-              mv ".sonar_tmp_hide/$f" "$f"
-              echo "Restored $f"
-            fi
+        HIDE_DIR=".sonar_tmp_hide"
+        if [ -d "$HIDE_DIR" ]; then
+          echo "Restoring hidden Maven/Gradle files..."
+          # Restore in reverse depth order so directories exist
+          mapfile -d '' RESTORE < <(find "$HIDE_DIR" -type f -print0 | sort -rz)
+          for SRC in "${RESTORE[@]}"; do
+            REL="${SRC#$HIDE_DIR/}"
+            DEST="$(pwd)/$REL"
+            mkdir -p "$(dirname "$DEST")"
+            mv "$SRC" "$DEST"
+            echo "  restored: $REL"
           done
-          rmdir .sonar_tmp_hide || true
+          rmdir "$HIDE_DIR" || true
+        else
+          echo "No hidden files to restore."
         fi
       displayName: "Restore Maven/Gradle files"
 
-    # Assert/print report-task.txt – FAIL the job if it's missing so we don't proceed to Publish with a confusing warning
+    # --- Verify report-task.txt exists; fail fast if missing ---
     - script: |
-        set -eux
+        set -euxo pipefail
         echo "Searching for report-task.txt..."
         FOUND=""
-        # Two common locations to check
         CANDIDATES="$(Build.SourcesDirectory)/.scannerwork/report-task.txt
         $(Agent.TempDirectory)/.sonarqube/out/.sonar/report-task.txt"
         for f in $CANDIDATES; do
@@ -129,7 +157,6 @@ stages:
             FOUND="$f"
           fi
         done
-        # If not found, search more broadly and fail
         if [ -z "$FOUND" ]; then
           echo "report-task.txt not found in common locations. Broad search follows:"
           find "$(Build.SourcesDirectory)" "$(Agent.TempDirectory)" -maxdepth 10 -type f -name "report-task.txt" -print -exec sed -n '1,160p' {} \; || true
@@ -138,7 +165,7 @@ stages:
         fi
       displayName: "Verify analysis output (report-task.txt)"
 
-    # Publish Quality Gate (now that report-task.txt is confirmed)
+    # --- Publish Quality Gate ---
     - task: SonarQubePublish@7
       displayName: "Publish Quality Gate (Python)"
       inputs:
