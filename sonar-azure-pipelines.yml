@@ -4,12 +4,15 @@ trigger:
       - main
 
 pool:
-  name: 'azureagent'   # self-hosted agent pool
+  name: 'azureagent'   # your self-hosted Linux agent pool
 
 variables:
-  SONARQUBE_SERVICE: 'sonarqube-connection'   # service connection name
+  SONARQUBE_SERVICE: 'sonarqube-connection'   # your SonarQube service connection name
 
 stages:
+# ============================
+#  PYTHON FRONTEND ANALYSIS
+# ============================
 - stage: Python_Analysis
   displayName: "Python Frontend - SonarQube Analysis"
   jobs:
@@ -18,43 +21,53 @@ stages:
     steps:
     - checkout: self
 
-    # Java needed for SonarScanner CLI
+    # --- Java is required for SonarScanner CLI ---
     - script: |
+        set -eux
         sudo apt-get update
         sudo apt-get install -y openjdk-17-jre
         java -version
-      displayName: "Install Java 17"
+      displayName: "Install Java 17 (required for SonarScanner CLI)"
 
+    # --- Prepare SonarQube (CLI/Other mode) ---
     - task: SonarQubePrepare@7
-      displayName: "Prepare SonarQube (Python)"
+      displayName: "Prepare SonarQube (Python via CLI)"
       inputs:
         SonarQube: $(SONARQUBE_SERVICE)
-        scannerMode: "Other"
+        scannerMode: "Other"             # CLI mode
         configMode: "manual"
         cliProjectKey: "vote-frontend-python"
         cliProjectName: "vote-frontend-python"
         extraProperties: |
           sonar.projectBaseDir=$(Build.SourcesDirectory)
           sonar.sources=vote
-          sonar.exclusions=**/__pycache__/**,**/venv/**,**/.venv/**
+          sonar.exclusions=**/__pycache__/**,**/venv/**,**/.venv/**,**/.tox/**
           sonar.python.coverage.reportPaths=vote/coverage.xml
           sonar.python.version=3.10
+          # Optional:
+          sonar.branch.name=$(Build.SourceBranchName)
 
-    - script: |
-        echo "Verifying sources..."
-        ls -la $(Build.SourcesDirectory)
-        test -d "$(Build.SourcesDirectory)/vote" || (echo "ERROR: vote/ not found" && exit 1)
-      displayName: "Verify sources directory exists"
-
-    - script: |
-        sudo apt-get update
-        sudo apt-get install -y python3 python3-venv python3-pip
-      displayName: "Ensure Python & venv are installed"
-
-    # Keep execution in repo root; target vote/ explicitly
+    # --- Verify sources exist ---
     - script: |
         set -e
-        cd $(Build.SourcesDirectory)
+        echo "Verifying source layout..."
+        ls -la "$(Build.SourcesDirectory)"
+        test -d "$(Build.SourcesDirectory)/vote" || (echo "ERROR: vote/ not found at repo root" && exit 1)
+      displayName: "Verify sources directory exists"
+
+    # --- Ensure Python is available ---
+    - script: |
+        set -eux
+        sudo apt-get update
+        sudo apt-get install -y python3 python3-venv python3-pip
+        python3 --version
+        pip3 --version
+      displayName: "Ensure Python & pip are installed"
+
+    # --- Create venv, install deps, run tests, generate coverage ---
+    - script: |
+        set -euxo pipefail
+        cd "$(Build.SourcesDirectory)"
         python3 -m venv .venv
         . .venv/bin/activate
         python -m pip install --upgrade pip
@@ -62,25 +75,60 @@ stages:
           python -m pip install -r vote/requirements.txt
         fi
         python -m pip install pytest pytest-cov
-        echo "Running tests with coverage in vote/..."
-        pytest vote -q --cov=vote --cov-report=xml:vote/coverage.xml || echo "pytest failed or no tests discovered; continuing"
-        test -f vote/coverage.xml && echo "coverage.xml generated" || echo "No coverage.xml generated"
-      displayName: "Run Python Tests (stay in root)"
+        echo "Running tests for vote/ with coverage..."
+        pytest vote -q --maxfail=1 --disable-warnings --cov=vote --cov-report=xml:vote/coverage.xml || echo "pytest failed or no tests discovered; continuing"
+        if [ -f vote/coverage.xml ]; then
+          echo "coverage.xml generated at vote/coverage.xml"
+        else
+          echo "WARNING: vote/coverage.xml not generated (analysis will still proceed)"
+        fi
+      displayName: "Run Python tests (stay in repo root)"
 
-    # (Optional) ensure we're at repo root (belt-and-braces)
+    # --- Manually invoke the prepared SonarScanner CLI ---
+    # This bypasses the extension's Maven/Gradle guard that was preventing Analyze from running.
     - script: |
-        cd $(Build.SourcesDirectory)
-        pwd
-      displayName: "Confirm repo root for analysis"
+        set -euxo pipefail
+        cd "$(Build.SourcesDirectory)"
 
-    - task: SonarQubeAnalyze@7
-      displayName: "Run SonarQube Analysis (Python)"
+        echo "Locating sonar-scanner prepared by SonarQubePrepare..."
+        # The Prepare task downloads/configures the CLI under the agent temp directory
+        # We'll look for the binary robustly:
+        SCANNER_BIN="$(find "$(Agent.TempDirectory)/.sonarqube" -type f -path "*/bin/sonar-scanner" | head -n1 || true)"
+        if [ -z "$SCANNER_BIN" ] || [ ! -x "$SCANNER_BIN" ]; then
+          echo "ERROR: Could not locate executable sonar-scanner prepared by SonarQubePrepare."
+          echo "Contents of $(Agent.TempDirectory)/.sonarqube for debugging:"
+          ls -R "$(Agent.TempDirectory)/.sonarqube" || true
+          exit 1
+        fi
+        echo "Using sonar-scanner at: $SCANNER_BIN"
 
+        # Run the scanner from repo root so it can see projectBaseDir and vote/ sources.
+        "$SCANNER_BIN" -Dsonar.projectBaseDir="$(Build.SourcesDirectory)"
+      displayName: "Run SonarScanner CLI (manual call)"
+
+    # --- Ensure report-task.txt is where Publish expects it & print it for debugging ---
     - script: |
-        echo "Searching for report-task.txt..."
-        find $(Build.SourcesDirectory) -maxdepth 6 -type f -name "report-task.txt" -print -exec sed -n '1,120p' {} \; || true
-      displayName: "Debug: Show report-task.txt if present"
+        set -euxo pipefail
 
+        # The CLI scanner writes .scannerwork/report-task.txt under the project base dir.
+        REPORT_SRC="$(Build.SourcesDirectory)/.scannerwork/report-task.txt"
+        if [ -f "$REPORT_SRC" ]; then
+          echo "Found report-task.txt at $REPORT_SRC"
+          echo "----- report-task.txt (source) -----"
+          sed -n '1,160p' "$REPORT_SRC" || true
+
+          # The Publish task expects it under $(Agent.TempDirectory)/.sonarqube/out/.sonar/
+          DEST_DIR="$(Agent.TempDirectory)/.sonarqube/out/.sonar"
+          mkdir -p "$DEST_DIR"
+          cp "$REPORT_SRC" "$DEST_DIR/report-task.txt"
+          echo "Copied report-task.txt to $DEST_DIR"
+        else
+          echo "report-task.txt not found at $REPORT_SRC. Searching more broadly..."
+          find "$(Build.SourcesDirectory)" "$(Agent.TempDirectory)" -type f -name "report-task.txt" -print -exec sed -n '1,160p' {} \; || true
+        fi
+      displayName: "Debug: ensure report-task.txt for Publish"
+
+    # --- Publish Quality Gate ---
     - task: SonarQubePublish@7
       displayName: "Publish Quality Gate (Python)"
       inputs:
