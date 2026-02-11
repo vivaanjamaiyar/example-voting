@@ -27,7 +27,7 @@ stages:
         sudo apt-get update
         sudo apt-get install -y openjdk-17-jre
         java -version
-      displayName: "Install Java 17 (required for SonarScanner CLI)"
+      displayName: "Install Java 17 (required for SonarScanner)"
 
     # --- Prepare SonarQube (CLI/Other mode) ---
     - task: SonarQubePrepare@7
@@ -44,7 +44,7 @@ stages:
           sonar.exclusions=**/__pycache__/**,**/venv/**,**/.venv/**,**/.tox/**
           sonar.python.coverage.reportPaths=vote/coverage.xml
           sonar.python.version=3.10
-          # Optional:
+          # (Optional) if you use branches:
           sonar.branch.name=$(Build.SourceBranchName)
 
     # --- Verify sources exist ---
@@ -65,6 +65,7 @@ stages:
       displayName: "Ensure Python & pip are installed"
 
     # --- Create venv, install deps, run tests, generate coverage ---
+    # Stay in repo root; target vote/ explicitly to avoid dir drift.
     - script: |
         set -euxo pipefail
         cd "$(Build.SourcesDirectory)"
@@ -84,49 +85,46 @@ stages:
         fi
       displayName: "Run Python tests (stay in repo root)"
 
-    # --- Manually invoke the prepared SonarScanner CLI ---
-    # This bypasses the extension's Maven/Gradle guard that was preventing Analyze from running.
+    # --- IMPORTANT: Avoid Analyze task's Maven/Gradle short-circuit in monorepo ---
+    # Temporarily move root-level Maven/Gradle files out of the way.
     - script: |
-        set -euxo pipefail
+        set -eux
         cd "$(Build.SourcesDirectory)"
+        mkdir -p .sonar_tmp_hide
+        # Only move root-level files; adjust the list if needed.
+        for f in pom.xml build.gradle build.gradle.kts settings.gradle settings.gradle.kts gradle.properties; do
+          if [ -f "$f" ]; then
+            mv "$f" ".sonar_tmp_hide/$f"
+            echo "Temporarily hid $f"
+          fi
+        done
+      displayName: "Temporarily hide root Maven/Gradle files (monorepo guard)"
 
-        echo "Locating sonar-scanner prepared by SonarQubePrepare..."
-        # The Prepare task downloads/configures the CLI under the agent temp directory
-        # We'll look for the binary robustly:
-        SCANNER_BIN="$(find "$(Agent.TempDirectory)/.sonarqube" -type f -path "*/bin/sonar-scanner" | head -n1 || true)"
-        if [ -z "$SCANNER_BIN" ] || [ ! -x "$SCANNER_BIN" ]; then
-          echo "ERROR: Could not locate executable sonar-scanner prepared by SonarQubePrepare."
-          echo "Contents of $(Agent.TempDirectory)/.sonarqube for debugging:"
-          ls -R "$(Agent.TempDirectory)/.sonarqube" || true
-          exit 1
-        fi
-        echo "Using sonar-scanner at: $SCANNER_BIN"
+    # --- Run Code Analysis via the Azure DevOps task ---
+    - task: SonarQubeAnalyze@7
+      displayName: "Run SonarQube Analysis (Python)"
 
-        # Run the scanner from repo root so it can see projectBaseDir and vote/ sources.
-        "$SCANNER_BIN" -Dsonar.projectBaseDir="$(Build.SourcesDirectory)"
-      displayName: "Run SonarScanner CLI (manual call)"
-
-    # --- Ensure report-task.txt is where Publish expects it & print it for debugging ---
+    # --- Restore the build files immediately after analysis ---
     - script: |
-        set -euxo pipefail
-
-        # The CLI scanner writes .scannerwork/report-task.txt under the project base dir.
-        REPORT_SRC="$(Build.SourcesDirectory)/.scannerwork/report-task.txt"
-        if [ -f "$REPORT_SRC" ]; then
-          echo "Found report-task.txt at $REPORT_SRC"
-          echo "----- report-task.txt (source) -----"
-          sed -n '1,160p' "$REPORT_SRC" || true
-
-          # The Publish task expects it under $(Agent.TempDirectory)/.sonarqube/out/.sonar/
-          DEST_DIR="$(Agent.TempDirectory)/.sonarqube/out/.sonar"
-          mkdir -p "$DEST_DIR"
-          cp "$REPORT_SRC" "$DEST_DIR/report-task.txt"
-          echo "Copied report-task.txt to $DEST_DIR"
-        else
-          echo "report-task.txt not found at $REPORT_SRC. Searching more broadly..."
-          find "$(Build.SourcesDirectory)" "$(Agent.TempDirectory)" -type f -name "report-task.txt" -print -exec sed -n '1,160p' {} \; || true
+        set -eux
+        cd "$(Build.SourcesDirectory)"
+        if [ -d .sonar_tmp_hide ]; then
+          for f in pom.xml build.gradle build.gradle.kts settings.gradle settings.gradle.kts gradle.properties; do
+            if [ -f ".sonar_tmp_hide/$f" ]; then
+              mv ".sonar_tmp_hide/$f" "$f"
+              echo "Restored $f"
+            fi
+          done
+          rmdir .sonar_tmp_hide || true
         fi
-      displayName: "Debug: ensure report-task.txt for Publish"
+      displayName: "Restore Maven/Gradle files"
+
+    # --- Debug: show where the scanner wrote report-task.txt ---
+    - script: |
+        set -eux
+        echo "Searching for report-task.txt..."
+        find "$(Build.SourcesDirectory)" "$(Agent.TempDirectory)" -maxdepth 8 -type f -name "report-task.txt" -print -exec sed -n '1,160p' {} \; || true
+      displayName: "Debug: Show report-task.txt if present"
 
     # --- Publish Quality Gate ---
     - task: SonarQubePublish@7
