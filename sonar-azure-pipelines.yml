@@ -4,15 +4,13 @@ trigger:
       - main
 
 pool:
-  name: 'azureagent'   # your self-hosted Linux agent pool
+  name: 'azureagent'   # your self-hosted Linux agent
 
 variables:
-  SONARQUBE_SERVICE: 'sonarqube-connection'   # your SonarQube service connection name
+  SONARQUBE_SERVICE: 'sonarqube-connection'
+  system.debug: 'true'  # enable verbose logs for Sonar tasks
 
 stages:
-# ============================
-#  PYTHON FRONTEND ANALYSIS
-# ============================
 - stage: Python_Analysis
   displayName: "Python Frontend - SonarQube Analysis"
   jobs:
@@ -21,20 +19,20 @@ stages:
     steps:
     - checkout: self
 
-    # --- Java is required for SonarScanner CLI ---
+    # Java is required by SonarScanner
     - script: |
         set -eux
         sudo apt-get update
         sudo apt-get install -y openjdk-17-jre
         java -version
-      displayName: "Install Java 17 (required for SonarScanner)"
+      displayName: "Install Java 17"
 
-    # --- Prepare SonarQube (CLI/Other mode) ---
+    # Prepare in CLI/Other mode
     - task: SonarQubePrepare@7
       displayName: "Prepare SonarQube (Python via CLI)"
       inputs:
         SonarQube: $(SONARQUBE_SERVICE)
-        scannerMode: "Other"             # CLI mode
+        scannerMode: "Other"
         configMode: "manual"
         cliProjectKey: "vote-frontend-python"
         cliProjectName: "vote-frontend-python"
@@ -44,18 +42,18 @@ stages:
           sonar.exclusions=**/__pycache__/**,**/venv/**,**/.venv/**,**/.tox/**
           sonar.python.coverage.reportPaths=vote/coverage.xml
           sonar.python.version=3.10
-          # (Optional) if you use branches:
+          # Optional if you use branches:
           sonar.branch.name=$(Build.SourceBranchName)
 
-    # --- Verify sources exist ---
+    # Verify repo layout
     - script: |
-        set -e
-        echo "Verifying source layout..."
+        set -eux
+        echo "Repo root: $(Build.SourcesDirectory)"
         ls -la "$(Build.SourcesDirectory)"
         test -d "$(Build.SourcesDirectory)/vote" || (echo "ERROR: vote/ not found at repo root" && exit 1)
       displayName: "Verify sources directory exists"
 
-    # --- Ensure Python is available ---
+    # Ensure Python
     - script: |
         set -eux
         sudo apt-get update
@@ -64,8 +62,7 @@ stages:
         pip3 --version
       displayName: "Ensure Python & pip are installed"
 
-    # --- Create venv, install deps, run tests, generate coverage ---
-    # Stay in repo root; target vote/ explicitly to avoid dir drift.
+    # Create venv, install deps, run tests & coverage (stay in repo root)
     - script: |
         set -euxo pipefail
         cd "$(Build.SourcesDirectory)"
@@ -76,35 +73,33 @@ stages:
           python -m pip install -r vote/requirements.txt
         fi
         python -m pip install pytest pytest-cov
-        echo "Running tests for vote/ with coverage..."
+        echo "Running pytest for vote/ with coverage..."
         pytest vote -q --maxfail=1 --disable-warnings --cov=vote --cov-report=xml:vote/coverage.xml || echo "pytest failed or no tests discovered; continuing"
         if [ -f vote/coverage.xml ]; then
           echo "coverage.xml generated at vote/coverage.xml"
         else
-          echo "WARNING: vote/coverage.xml not generated (analysis will still proceed)"
+          echo "WARNING: vote/coverage.xml not generated (analysis will still proceed without coverage)"
         fi
-      displayName: "Run Python tests (stay in repo root)"
+      displayName: "Run Python tests (root, target vote/)"
 
-    # --- IMPORTANT: Avoid Analyze task's Maven/Gradle short-circuit in monorepo ---
-    # Temporarily move root-level Maven/Gradle files out of the way.
+    # Hide root Maven/Gradle files to prevent Analyze short-circuit in monorepos
     - script: |
         set -eux
         cd "$(Build.SourcesDirectory)"
         mkdir -p .sonar_tmp_hide
-        # Only move root-level files; adjust the list if needed.
         for f in pom.xml build.gradle build.gradle.kts settings.gradle settings.gradle.kts gradle.properties; do
           if [ -f "$f" ]; then
             mv "$f" ".sonar_tmp_hide/$f"
             echo "Temporarily hid $f"
           fi
         done
-      displayName: "Temporarily hide root Maven/Gradle files (monorepo guard)"
+      displayName: "Temporarily hide root Maven/Gradle files"
 
-    # --- Run Code Analysis via the Azure DevOps task ---
+    # Run analysis via the ADO task (uses the service connection)
     - task: SonarQubeAnalyze@7
       displayName: "Run SonarQube Analysis (Python)"
 
-    # --- Restore the build files immediately after analysis ---
+    # Restore build files right after analyze
     - script: |
         set -eux
         cd "$(Build.SourcesDirectory)"
@@ -119,14 +114,31 @@ stages:
         fi
       displayName: "Restore Maven/Gradle files"
 
-    # --- Debug: show where the scanner wrote report-task.txt ---
+    # Assert/print report-task.txt – FAIL the job if it's missing so we don't proceed to Publish with a confusing warning
     - script: |
         set -eux
         echo "Searching for report-task.txt..."
-        find "$(Build.SourcesDirectory)" "$(Agent.TempDirectory)" -maxdepth 8 -type f -name "report-task.txt" -print -exec sed -n '1,160p' {} \; || true
-      displayName: "Debug: Show report-task.txt if present"
+        FOUND=""
+        # Two common locations to check
+        CANDIDATES="$(Build.SourcesDirectory)/.scannerwork/report-task.txt
+        $(Agent.TempDirectory)/.sonarqube/out/.sonar/report-task.txt"
+        for f in $CANDIDATES; do
+          if [ -f "$f" ]; then
+            echo "Found report-task.txt at: $f"
+            sed -n '1,160p' "$f" || true
+            FOUND="$f"
+          fi
+        done
+        # If not found, search more broadly and fail
+        if [ -z "$FOUND" ]; then
+          echo "report-task.txt not found in common locations. Broad search follows:"
+          find "$(Build.SourcesDirectory)" "$(Agent.TempDirectory)" -maxdepth 10 -type f -name "report-task.txt" -print -exec sed -n '1,160p' {} \; || true
+          echo "ERROR: SonarQube analysis did not produce report-task.txt; cannot publish Quality Gate for this build."
+          exit 1
+        fi
+      displayName: "Verify analysis output (report-task.txt)"
 
-    # --- Publish Quality Gate ---
+    # Publish Quality Gate (now that report-task.txt is confirmed)
     - task: SonarQubePublish@7
       displayName: "Publish Quality Gate (Python)"
       inputs:
